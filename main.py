@@ -69,7 +69,7 @@ class Config:
     wandb_project = "PARADIS-Qwen-Pipeline"
     wandb_run_name = "Kaggle-DeepSpeed-Pipeline-2GPU"
     use_hf = True
-    hf_repo = "h9art/PARADIS-Qwen-Pipeline-Kaggle"
+    hf_repo = "MinhNghia/PARADIS-Qwen-Pipeline-Kaggle"
     train_size = 1000  # Giảm size để test
     valid_size = 100
     min_text_length = 50
