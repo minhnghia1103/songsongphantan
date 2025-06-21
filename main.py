@@ -14,59 +14,47 @@ from tqdm import tqdm
 from datasets import load_dataset
 import numpy as np
 from huggingface_hub import login
-import subprocess  # Thêm để chạy nvidia-smi
+import subprocess
 
 # Thiết lập hạt giống ngẫu nhiên
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Lấy thông tin từ biến môi trường do deepspeed.launch cung cấp
+# Lấy thông tin từ biến môi trường
 local_rank = int(os.environ.get('LOCAL_RANK', 0))
-world_size = int(os.environ.get('WORLD_SIZE', torch.cuda.device_count()))  # Dùng torch.cuda.device_count()
-rank = int(os.environ.get('RANK', local_rank))
+world_size = int(os.environ.get('WORLD_SIZE', 1))
+rank = int(os.environ.get('RANK', 0))
 
-# Hàm kiểm tra GPU và trạng thái sử dụng
+print(f"Rank {rank}: Initializing with local_rank={local_rank}, world_size={world_size}")
+
+# Khởi tạo distributed training
+if not dist.is_initialized():
+    dist.init_process_group(backend='nccl')
+
+torch.cuda.set_device(local_rank)
+device = torch.device(f'cuda:{local_rank}')
+
+# Hàm kiểm tra GPU
 def check_gpu_status():
-    gpu_info = f"Rank {rank}: Local rank: {local_rank}, Device: {torch.cuda.current_device()}, Device name: {torch.cuda.get_device_name(local_rank)}\n"
-    gpu_info += f"Rank {rank}: Total GPUs available: {torch.cuda.device_count()}\n"
-    try:
-        # Chạy nvidia-smi để lấy thông tin GPU
-        nvidia_smi_output = subprocess.check_output(['nvidia-smi', '--query-gpu=index,utilization.gpu,memory.used,memory.total', '--format=csv']).decode('utf-8')
-        gpu_info += f"Rank {rank}: nvidia-smi output:\n{nvidia_smi_output}\n"
-    except Exception as e:
-        gpu_info += f"Rank {rank}: Could not run nvidia-smi: {e}\n"
+    gpu_info = f"Rank {rank}: Local rank: {local_rank}, Device: {torch.cuda.current_device()}\n"
+    gpu_info += f"Rank {rank}: Device name: {torch.cuda.get_device_name(local_rank)}\n"
+    gpu_info += f"Rank {rank}: Total GPUs: {torch.cuda.device_count()}\n"
+    gpu_info += f"Rank {rank}: Memory allocated: {torch.cuda.memory_allocated(local_rank) / 1024**3:.2f} GB\n"
     return gpu_info
 
-# Kiểm tra GPU ban đầu
 if rank == 0:
-    print("Checking GPU status at initialization...")
+    print("GPU Status at initialization:")
     print(check_gpu_status())
 
-# Thiết lập biến môi trường cho wandb
-os.environ["WANDB_DIR"] = "/kaggle/working/wandb"
-os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
-
-# Khởi tạo môi trường phân tán
-if not dist.is_initialized():
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank,
-        timeout=torch.distributed.default_pg_timeout
-    )
-torch.cuda.set_device(local_rank)
-deepspeed.init_distributed(dist_backend='nccl')
-
-# Cấu hình huấn luyện
+# Cấu hình
 class Config:
     model_name = "Qwen/Qwen2.5-0.5B"
     dataset_name = "vietgpt/wikipedia_vi"
     output_dir = "/kaggle/working/qwen-vietnamese-wiki-pipeline"
     num_train_epochs = 3
-    per_device_train_batch_size = 2
-    per_device_valid_batch_size = 2
-    gradient_accumulation_steps = 8
+    per_device_train_batch_size = 1  # Giảm batch size
+    per_device_valid_batch_size = 1
+    gradient_accumulation_steps = 16  # Tăng gradient accumulation
     learning_rate = 5e-5
     weight_decay = 0.01
     warmup_ratio = 0.1
@@ -79,37 +67,40 @@ class Config:
     num_workers = 0
     use_wandb = True
     wandb_project = "PARADIS-Qwen-Pipeline"
-    wandb_run_name = "Kaggle-DeepSpeed-Pipeline-2T4"
+    wandb_run_name = "Kaggle-DeepSpeed-Pipeline-2GPU"
     use_hf = True
     hf_repo = "h9art/PARADIS-Qwen-Pipeline-Kaggle"
-    train_size = 5000
-    valid_size = 500
+    train_size = 1000  # Giảm size để test
+    valid_size = 100
     min_text_length = 50
     random_seed = 42
-    num_stages = 2
+    num_stages = 2  # 2 stages cho 2 GPU
     partition_method = "uniform"
 
 config = Config()
 
-# Khởi tạo wandb chỉ trên rank 0
+# Khởi tạo wandb và HF chỉ trên rank 0
 if rank == 0:
-    from kaggle_secrets import UserSecretsClient
-    user_secrets = UserSecretsClient()
-    WANDB_API_KEY = user_secrets.get_secret("WANDB_API_KEY")
-    wandb.login(key=WANDB_API_KEY)
-    if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            name=config.wandb_run_name,
-            config=config.__dict__,
-        )
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        
+        if config.use_wandb:
+            WANDB_API_KEY = user_secrets.get_secret("WANDB_API_KEY")
+            wandb.login(key=WANDB_API_KEY)
+            wandb.init(
+                project=config.wandb_project,
+                name=config.wandb_run_name,
+                config=config.__dict__,
+            )
+        
+        if config.use_hf:
+            HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
+            login(HF_TOKEN)
+    except Exception as e:
+        print(f"Warning: Could not initialize wandb/hf: {e}")
 
-# Đăng nhập Hugging Face
-if config.use_hf and rank == 0:
-    HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
-    login(HF_TOKEN)
-
-# Tải tokenizer và cấu hình mô hình
+# Tải tokenizer và config
 tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -122,9 +113,9 @@ num_heads = model_config.num_attention_heads
 intermediate_size = model_config.intermediate_size
 
 if rank == 0:
-    print(f"Cấu hình mô hình: vocab_size={vocab_size}, hidden_size={hidden_size}, num_layers={num_layers}")
+    print(f"Model config: vocab_size={vocab_size}, hidden_size={hidden_size}, num_layers={num_layers}")
 
-# Lớp Dataset
+# Dataset class
 class WikiViDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length):
         self.dataset = dataset
@@ -155,7 +146,10 @@ class WikiViDataset(Dataset):
             "labels": input_ids.clone()
         }
 
-# Tải dataset
+# Load dataset
+if rank == 0:
+    print("Loading dataset...")
+
 dataset = load_dataset(config.dataset_name, split="train")
 dataset = dataset.select_columns(['title', 'text'])
 
@@ -173,46 +167,68 @@ train_split = dataset.select(range(config.train_size))
 valid_split = dataset.select(range(config.train_size, config.train_size + config.valid_size))
 
 if rank == 0:
-    print(f"Số mẫu huấn luyện: {len(train_split)}")
-    print(f"Số mẫu kiểm tra: {len(valid_split)}")
+    print(f"Train samples: {len(train_split)}")
+    print(f"Valid samples: {len(valid_split)}")
 
 train_ds = WikiViDataset(train_split, tokenizer, config.max_length)
 valid_ds = WikiViDataset(valid_split, tokenizer, config.max_length)
 
-# Định nghĩa các lớp cho Pipeline
+# Pipeline components - cải thiện implementation
 class PipelineEmbedding(nn.Module):
     def __init__(self, vocab_size, hidden_size):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_dim = hidden_size
         
-    def forward(self, input_ids):
-        if isinstance(input_ids, tuple):
-            input_ids = input_ids[0]
-        return self.embed_tokens(input_ids)
+    def forward(self, x):
+        # Handle both tuple and tensor input
+        if isinstance(x, tuple):
+            input_ids = x[0]
+        else:
+            input_ids = x
+            
+        # Ensure input_ids is 2D
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+            
+        embeddings = self.embed_tokens(input_ids)
+        return embeddings
 
 class PipelineTransformerLayer(nn.Module):
     def __init__(self, hidden_size, num_heads, intermediate_size):
         super().__init__()
+        self.hidden_size = hidden_size
         self.self_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, dropout=0.0, batch_first=True
+            hidden_size, num_heads, dropout=0.1, batch_first=True
         )
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, intermediate_size),
             nn.GELU(),
-            nn.Linear(intermediate_size, hidden_size)
+            nn.Dropout(0.1),
+            nn.Linear(intermediate_size, hidden_size),
+            nn.Dropout(0.1)
         )
-        self.input_layernorm = nn.LayerNorm(hidden_size)
-        self.post_attention_layernorm = nn.LayerNorm(hidden_size)
+        self.input_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.post_attention_layernorm = nn.LayerNorm(hidden_size, eps=1e-6)
         
-    def forward(self, hidden_states):
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
+    def forward(self, x):
+        if isinstance(x, tuple):
+            hidden_states = x[0]
+        else:
+            hidden_states = x
             
+        # Self attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_output, _ = self.self_attn(hidden_states, hidden_states, hidden_states)
-        hidden_states = residual + attn_output
         
+        try:
+            attn_output, _ = self.self_attn(hidden_states, hidden_states, hidden_states)
+            hidden_states = residual + attn_output
+        except Exception as e:
+            print(f"Attention error: {e}")
+            hidden_states = residual
+        
+        # MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -223,21 +239,25 @@ class PipelineTransformerLayer(nn.Module):
 class PipelineLMHead(nn.Module):
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         
-    def forward(self, hidden_states):
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
+    def forward(self, x):
+        if isinstance(x, tuple):
+            hidden_states = x[0]
+        else:
+            hidden_states = x
             
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
         return logits
 
+# Loss function với cải thiện
 class PipelineLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, vocab_size, pad_token_id):
         super().__init__()
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='mean')
+        self.vocab_size = vocab_size
         
     def forward(self, logits, labels):
         if isinstance(logits, tuple):
@@ -245,36 +265,50 @@ class PipelineLoss(nn.Module):
         if isinstance(labels, tuple):
             labels = labels[0]
             
+        # Ensure same device
         if logits.device != labels.device:
             labels = labels.to(logits.device)
             
+        # Shift for causal LM
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
-        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        # Flatten for loss calculation
+        shift_logits = shift_logits.view(-1, self.vocab_size)
         shift_labels = shift_labels.view(-1)
         
         loss = self.loss_fn(shift_logits, shift_labels)
         return loss
 
-# Tạo mô hình Pipeline
-layers = [
-    LayerSpec(PipelineEmbedding, vocab_size, hidden_size),
-    *[LayerSpec(PipelineTransformerLayer, hidden_size, num_heads, intermediate_size) for _ in range(num_layers)],
-    LayerSpec(PipelineLMHead, hidden_size, vocab_size)
-]
+# Tạo pipeline model
+if rank == 0:
+    print("Creating pipeline model...")
 
+# Tạo layers cho pipeline
+layers = []
+
+# Embedding layer
+layers.append(LayerSpec(PipelineEmbedding, vocab_size, hidden_size))
+
+# Transformer layers
+for i in range(num_layers):
+    layers.append(LayerSpec(PipelineTransformerLayer, hidden_size, num_heads, intermediate_size))
+
+# Output layer
+layers.append(LayerSpec(PipelineLMHead, hidden_size, vocab_size))
+
+# Tạo pipeline model
 model = PipelineModule(
     layers=layers,
     num_stages=config.num_stages,
-    loss_fn=PipelineLoss(),
+    loss_fn=PipelineLoss(vocab_size, tokenizer.pad_token_id),
     partition_method=config.partition_method,
     activation_checkpoint_interval=1
 )
 
-# Cấu hình DeepSpeed
+# DeepSpeed config với cải thiện
 ds_config = {
-    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * 1,
+    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * world_size,
     "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,
     "gradient_accumulation_steps": config.gradient_accumulation_steps,
     "optimizer": {
@@ -291,7 +325,7 @@ ds_config = {
         "params": {
             "warmup_min_lr": 0,
             "warmup_max_lr": config.learning_rate,
-            "warmup_num_steps": 100
+            "warmup_num_steps": 50
         }
     },
     "fp16": {
@@ -310,20 +344,19 @@ ds_config = {
         "data_parallel_size": 1,
     },
     "zero_optimization": {
-        "stage": 0
+        "stage": 0  # Disable ZeRO for pipeline
     },
-    "verbose": True
+    "wall_clock_breakdown": False,
+    "memory_breakdown": False
 }
 
-# Hàm collate
+# Collate function
 def collate_fn(batch):
     input_ids = torch.stack([item['input_ids'] for item in batch])
     labels = torch.stack([item['labels'] for item in batch])
-    if torch.cuda.is_available():
-        input_ids = input_ids.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
     return (input_ids, labels)
 
+# DataLoaders
 train_dataloader = DataLoader(
     train_ds,
     batch_size=config.per_device_train_batch_size,
@@ -344,48 +377,50 @@ valid_dataloader = DataLoader(
     drop_last=False
 )
 
-# Khởi tạo DeepSpeed Engine
+# Initialize DeepSpeed
+if rank == 0:
+    print("Initializing DeepSpeed...")
+
 model_engine, optimizer, _, scheduler = deepspeed.initialize(
     model=model,
-    model_parameters=[p for p in model.parameters() if p.requires_grad],
     config=ds_config
 )
 
-# Hàm huấn luyện
-def train_pipeline_step(model_engine, data_iter):
+# Training functions
+def train_pipeline_step(model_engine, batch_data):
     try:
+        data_iter = iter([batch_data])
         loss = model_engine.train_batch(data_iter=data_iter)
-        return loss.item() if loss is not None else 0.0
+        return loss.item() if loss is not None else None
     except Exception as e:
         if rank == 0:
-            print(f"Lỗi trong bước huấn luyện: {e}")
-        torch.cuda.empty_cache()
-        gc.collect()
+            print(f"Training step error: {e}")
         return None
 
-# Hàm kiểm tra
-def validate_pipeline_model(model_engine, dataloader):
+def validate_pipeline_model(model_engine, dataloader, max_steps=20):
     model_engine.eval()
     total_loss = 0
     num_batches = 0
     
     with torch.no_grad():
-        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc="Đang kiểm tra", disable=rank != 0)):
+        for batch_idx, batch_data in enumerate(dataloader):
+            if batch_idx >= max_steps:
+                break
+                
             try:
                 data_iter = iter([batch_data])
                 loss = model_engine.eval_batch(data_iter=data_iter)
                 
-                if loss is not None and not torch.isnan(torch.tensor(loss)) and not torch.isinf(torch.tensor(loss)):
+                if loss is not None and not torch.isnan(torch.tensor(loss)):
                     total_loss += loss.item()
                     num_batches += 1
                     
-                if batch_idx >= 50:
-                    break
-                    
             except Exception as e:
                 if rank == 0:
-                    print(f"Lỗi bước kiểm tra {batch_idx}: {e}")
+                    print(f"Validation step {batch_idx} error: {e}")
                 continue
+    
+    model_engine.train()
     
     if num_batches > 0:
         avg_loss = total_loss / num_batches
@@ -393,88 +428,66 @@ def validate_pipeline_model(model_engine, dataloader):
         return avg_loss, perplexity
     return float('inf'), float('inf')
 
-# Vòng lặp huấn luyện
+# Training loop
 if rank == 0:
-    print("Bắt đầu huấn luyện DeepSpeed Pipeline...")
+    print("Starting training...")
+    
 os.makedirs(config.output_dir, exist_ok=True)
-
-training_history = {
-    'train_losses': [],
-    'valid_losses': [],
-    'valid_perplexities': []
-}
 
 best_valid_loss = float('inf')
 
 for epoch in range(config.num_train_epochs):
     if rank == 0:
-        print(f"\n{'=' * 60}")
-        print(f"Epoch {epoch + 1}/{config.num_train_epochs}")
-        print(f"{'=' * 60}")
+        print(f"\nEpoch {epoch + 1}/{config.num_train_epochs}")
     
     model_engine.train()
-    start_time = time.time()
     total_loss = 0
-    num_steps = 0
     successful_steps = 0
     
-    progress_bar = tqdm(train_dataloader, desc=f"Huấn luyện Epoch {epoch + 1}", disable=rank != 0)
+    progress_bar = tqdm(train_dataloader, desc=f"Training Epoch {epoch + 1}", disable=rank != 0)
     
     for step, batch_data in enumerate(progress_bar):
-        data_iter = iter([batch_data])
-        loss = train_pipeline_step(model_engine, data_iter)
+        loss = train_pipeline_step(model_engine, batch_data)
         
-        if loss is not None and not math.isnan(loss) and not math.isinf(loss):
+        if loss is not None and not math.isnan(loss):
             total_loss += loss
             successful_steps += 1
             
             if rank == 0:
                 progress_bar.set_postfix({
                     'loss': f"{loss:.4f}",
-                    'avg_loss': f"{total_loss/successful_steps:.4f}",
-                    'success_rate': f"{successful_steps}/{step+1}"
+                    'avg_loss': f"{total_loss/successful_steps:.4f}" if successful_steps > 0 else "N/A"
                 })
                 
                 if config.use_wandb and (step + 1) % config.logging_steps == 0:
                     wandb.log({
                         "train_loss": loss,
-                        "train_step": epoch * len(train_dataloader) + step + 1,
-                        "epoch": epoch + 1,
-                        "success_rate": successful_steps / (step + 1)
+                        "step": epoch * len(train_dataloader) + step + 1,
+                        "epoch": epoch + 1
                     })
         
-        num_steps += 1
-        
-        # Kiểm tra GPU định kỳ (mỗi 100 bước)
-        if step % 100 == 0 and rank == 0:
-            print(f"Step {step}: GPU Status\n{check_gpu_status()}")
-        
-        if step % 20 == 0:
+        # Clean up memory periodically
+        if step % 10 == 0:
             torch.cuda.empty_cache()
-            gc.collect()
+            
+        # Limit steps for testing
+        if step >= 50:
+            break
     
     avg_train_loss = total_loss / successful_steps if successful_steps > 0 else float('inf')
-    training_history['train_losses'].append(avg_train_loss)
-    
-    train_time = time.time() - start_time
-    if rank == 0:
-        print(f"Huấn luyện hoàn tất trong {train_time/60:.1f} phút")
-        print(f"Loss huấn luyện trung bình: {avg_train_loss:.4f}")
-        print(f"Số bước thành công: {successful_steps}/{num_steps}")
     
     if rank == 0:
-        print("Đang chạy kiểm tra...")
-    start_time = time.time()
+        print(f"Average training loss: {avg_train_loss:.4f}")
+        print(f"Successful steps: {successful_steps}")
+    
+    # Validation
+    if rank == 0:
+        print("Running validation...")
     
     valid_loss, perplexity = validate_pipeline_model(model_engine, valid_dataloader)
     
-    valid_time = time.time() - start_time
-    training_history['valid_losses'].append(valid_loss)
-    training_history['valid_perplexities'].append(perplexity)
-    
     if rank == 0:
-        print(f"Kiểm tra hoàn tất trong {valid_time/60:.1f} phút")
-        print(f"Loss kiểm tra: {valid_loss:.4f}")
+        print(f"Validation loss: {valid_loss:.4f}")
         print(f"Perplexity: {perplexity:.2f}")
         
         if config.use_wandb:
@@ -482,36 +495,29 @@ for epoch in range(config.num_train_epochs):
                 "epoch": epoch + 1,
                 "avg_train_loss": avg_train_loss,
                 "valid_loss": valid_loss,
-                "perplexity": perplexity,
-                "train_time_mins": train_time/60,
-                "valid_time_mins": valid_time/60,
-                "successful_steps": successful_steps,
-                "total_steps": num_steps
+                "perplexity": perplexity
             })
     
+    # Save best model
     if valid_loss < best_valid_loss and not math.isnan(valid_loss):
         best_valid_loss = valid_loss
         if rank == 0:
-            print(f"🎉 Mô hình tốt nhất! Loss kiểm tra: {valid_loss:.4f}")
+            print(f"New best model! Validation loss: {valid_loss:.4f}")
             checkpoint_path = os.path.join(config.output_dir, "best_checkpoint")
             model_engine.save_checkpoint(checkpoint_path)
             tokenizer.save_pretrained(config.output_dir)
-            torch.save(training_history, os.path.join(config.output_dir, 'training_history.pt'))
-            print(f"Mô hình đã lưu tại {checkpoint_path}")
     
     torch.cuda.empty_cache()
     gc.collect()
 
-# Lưu checkpoint cuối cùng
+# Final cleanup
 if rank == 0:
+    print("Training completed!")
     final_checkpoint = os.path.join(config.output_dir, "final_checkpoint")
     model_engine.save_checkpoint(final_checkpoint)
-    print(f"Mô hình pipeline cuối cùng đã lưu tại {final_checkpoint}")
-
-if config.use_wandb and rank == 0:
-    wandb.finish()
-
-if rank == 0:
-    print("🎊 Hoàn tất huấn luyện DeepSpeed Pipeline!")
+    
+    if config.use_wandb:
+        wandb.finish()
+    
     print("Final GPU Status:")
     print(check_gpu_status())
