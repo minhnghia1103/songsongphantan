@@ -22,8 +22,17 @@ np.random.seed(42)
 
 # Lấy thông tin từ biến môi trường do deepspeed.launch cung cấp
 local_rank = int(os.environ.get('LOCAL_RANK', 0))
-world_size = int(os.environ.get('WORLD_SIZE', 1))
-rank = int(os.environ.get('RANK', 0))
+world_size = int(os.environ.get('WORLD_SIZE', torch.cuda.device_count()))  # Dùng torch.cuda.device_count()
+rank = int(os.environ.get('RANK', local_rank))
+
+# Kiểm tra GPU
+print(f"Rank {rank}: Number of GPUs: {torch.cuda.device_count()}")
+if torch.cuda.device_count() < 2 and rank == 0:
+    print("Warning: Need 2 GPUs for pipeline parallelism. Check Kaggle settings.")
+
+# Thiết lập biến môi trường cho wandb
+os.environ["WANDB_DIR"] = "/kaggle/working/wandb"
+os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
 
 # Khởi tạo môi trường phân tán
 if not dist.is_initialized():
@@ -32,7 +41,7 @@ if not dist.is_initialized():
         init_method='env://',
         world_size=world_size,
         rank=rank,
-        timeout=torch.distributed.default_pg_timeout * 2  # Tăng timeout lên gấp đôi
+        timeout=torch.distributed.default_pg_timeout
     )
 torch.cuda.set_device(local_rank)
 deepspeed.init_distributed(dist_backend='nccl')
@@ -41,7 +50,7 @@ deepspeed.init_distributed(dist_backend='nccl')
 class Config:
     model_name = "Qwen/Qwen2.5-0.5B"
     dataset_name = "vietgpt/wikipedia_vi"
-    output_dir = "./qwen-vietnamese-wiki-pipeline"
+    output_dir = "/kaggle/working/qwen-vietnamese-wiki-pipeline"  # Sử dụng /kaggle/working/
     num_train_epochs = 3
     per_device_train_batch_size = 2
     per_device_valid_batch_size = 2
@@ -253,7 +262,7 @@ model = PipelineModule(
 
 # Cấu hình DeepSpeed
 ds_config = {
-    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * world_size,
+    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * world_size,  # 2 * 8 * 2 = 32
     "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,
     "gradient_accumulation_steps": config.gradient_accumulation_steps,
     "optimizer": {
@@ -290,7 +299,8 @@ ds_config = {
     },
     "zero_optimization": {
         "stage": 0
-    }
+    },
+    "verbose": True
 }
 
 # Hàm collate
