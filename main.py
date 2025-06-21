@@ -1,4 +1,3 @@
-# train.py
 import os
 import torch
 import deepspeed
@@ -15,6 +14,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 import numpy as np
 from huggingface_hub import login
+import subprocess  # Thêm để chạy nvidia-smi
 
 # Thiết lập hạt giống ngẫu nhiên
 torch.manual_seed(42)
@@ -25,10 +25,22 @@ local_rank = int(os.environ.get('LOCAL_RANK', 0))
 world_size = int(os.environ.get('WORLD_SIZE', torch.cuda.device_count()))  # Dùng torch.cuda.device_count()
 rank = int(os.environ.get('RANK', local_rank))
 
-# Kiểm tra GPU
-print(f"Rank {rank}: Number of GPUs: {torch.cuda.device_count()}")
-if torch.cuda.device_count() < 2 and rank == 0:
-    print("Warning: Need 2 GPUs for pipeline parallelism. Check Kaggle settings.")
+# Hàm kiểm tra GPU và trạng thái sử dụng
+def check_gpu_status():
+    gpu_info = f"Rank {rank}: Local rank: {local_rank}, Device: {torch.cuda.current_device()}, Device name: {torch.cuda.get_device_name(local_rank)}\n"
+    gpu_info += f"Rank {rank}: Total GPUs available: {torch.cuda.device_count()}\n"
+    try:
+        # Chạy nvidia-smi để lấy thông tin GPU
+        nvidia_smi_output = subprocess.check_output(['nvidia-smi', '--query-gpu=index,utilization.gpu,memory.used,memory.total', '--format=csv']).decode('utf-8')
+        gpu_info += f"Rank {rank}: nvidia-smi output:\n{nvidia_smi_output}\n"
+    except Exception as e:
+        gpu_info += f"Rank {rank}: Could not run nvidia-smi: {e}\n"
+    return gpu_info
+
+# Kiểm tra GPU ban đầu
+if rank == 0:
+    print("Checking GPU status at initialization...")
+    print(check_gpu_status())
 
 # Thiết lập biến môi trường cho wandb
 os.environ["WANDB_DIR"] = "/kaggle/working/wandb"
@@ -50,7 +62,7 @@ deepspeed.init_distributed(dist_backend='nccl')
 class Config:
     model_name = "Qwen/Qwen2.5-0.5B"
     dataset_name = "vietgpt/wikipedia_vi"
-    output_dir = "/kaggle/working/qwen-vietnamese-wiki-pipeline"  # Sử dụng /kaggle/working/
+    output_dir = "/kaggle/working/qwen-vietnamese-wiki-pipeline"
     num_train_epochs = 3
     per_device_train_batch_size = 2
     per_device_valid_batch_size = 2
@@ -262,9 +274,9 @@ model = PipelineModule(
 
 # Cấu hình DeepSpeed
 ds_config = {
-    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * 1,  # 2 * 8 * 1 = 16
-    "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,  # 2
-    "gradient_accumulation_steps": config.gradient_accumulation_steps,  # 8
+    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * 1,
+    "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,
+    "gradient_accumulation_steps": config.gradient_accumulation_steps,
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -294,7 +306,7 @@ ds_config = {
     "steps_per_print": config.logging_steps,
     "pipeline": {
         "activation_checkpoint_interval": 1,
-        "pipe_parallel_size": config.num_stages,  # 2
+        "pipe_parallel_size": config.num_stages,
         "data_parallel_size": 1,
     },
     "zero_optimization": {
@@ -433,6 +445,10 @@ for epoch in range(config.num_train_epochs):
         
         num_steps += 1
         
+        # Kiểm tra GPU định kỳ (mỗi 100 bước)
+        if step % 100 == 0 and rank == 0:
+            print(f"Step {step}: GPU Status\n{check_gpu_status()}")
+        
         if step % 20 == 0:
             torch.cuda.empty_cache()
             gc.collect()
@@ -497,3 +513,5 @@ if config.use_wandb and rank == 0:
 
 if rank == 0:
     print("🎊 Hoàn tất huấn luyện DeepSpeed Pipeline!")
+    print("Final GPU Status:")
+    print(check_gpu_status())
