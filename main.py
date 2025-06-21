@@ -262,9 +262,9 @@ model = PipelineModule(
 
 # Cấu hình DeepSpeed
 ds_config = {
-    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * world_size,  # 2 * 8 * 2 = 32
-    "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,
-    "gradient_accumulation_steps": config.gradient_accumulation_steps,
+    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * 1,  # 2 * 8 * 1 = 16
+    "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,  # 2
+    "gradient_accumulation_steps": config.gradient_accumulation_steps,  # 8
     "optimizer": {
         "type": "AdamW",
         "params": {
@@ -294,7 +294,7 @@ ds_config = {
     "steps_per_print": config.logging_steps,
     "pipeline": {
         "activation_checkpoint_interval": 1,
-        "pipe_parallel_size": config.num_stages,
+        "pipe_parallel_size": config.num_stages,  # 2
         "data_parallel_size": 1,
     },
     "zero_optimization": {
