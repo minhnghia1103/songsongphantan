@@ -72,9 +72,9 @@ class Config:
     dataset_name = "vietgpt/wikipedia_vi"
     output_dir = "/kaggle/working/qwen-vietnamese-wiki-pipeline"
     num_train_epochs = 3
-    per_device_train_batch_size = 1  # Giảm batch size
+    per_device_train_batch_size = 1  # Micro batch size per GPU
     per_device_valid_batch_size = 1
-    gradient_accumulation_steps = 16  # Tăng gradient accumulation
+    gradient_accumulation_steps = 8  # Giảm xuống để tránh OOM
     learning_rate = 5e-5
     weight_decay = 0.01
     warmup_ratio = 0.1
@@ -87,7 +87,7 @@ class Config:
     num_workers = 0
     use_wandb = True
     wandb_project = "PARADIS-Qwen-Pipeline"
-    wandb_run_name = "Kaggle-DeepSpeed-Pipeline-2GPU"
+    wandb_run_name = "Kaggle-DeepSpeed-Pipeline-2GPU-Fixed"
     use_hf = True
     hf_repo = "MinhNghia/PARADIS-Qwen-Pipeline-Kaggle"
     train_size = 1000  # Giảm size để test
@@ -326,9 +326,23 @@ model = PipelineModule(
     activation_checkpoint_interval=1
 )
 
-# DeepSpeed config với cải thiện
+# Tính toán batch size chính xác cho DeepSpeed Pipeline
+# Với Pipeline Parallelism, data_parallel_size = world_size / pipe_parallel_size
+data_parallel_size = world_size // config.num_stages
+train_batch_size = config.per_device_train_batch_size * config.gradient_accumulation_steps * data_parallel_size
+
+if rank == 0:
+    print(f"Batch size calculation:")
+    print(f"  per_device_train_batch_size: {config.per_device_train_batch_size}")
+    print(f"  gradient_accumulation_steps: {config.gradient_accumulation_steps}")
+    print(f"  world_size: {world_size}")
+    print(f"  num_stages: {config.num_stages}")
+    print(f"  data_parallel_size: {data_parallel_size}")
+    print(f"  train_batch_size: {train_batch_size}")
+
+# DeepSpeed config với batch size được tính đúng
 ds_config = {
-    "train_batch_size": config.per_device_train_batch_size * config.gradient_accumulation_steps * world_size,
+    "train_batch_size": train_batch_size,
     "train_micro_batch_size_per_gpu": config.per_device_train_batch_size,
     "gradient_accumulation_steps": config.gradient_accumulation_steps,
     "optimizer": {
@@ -361,10 +375,10 @@ ds_config = {
     "pipeline": {
         "activation_checkpoint_interval": 1,
         "pipe_parallel_size": config.num_stages,
-        "data_parallel_size": 1,
+        "data_parallel_size": data_parallel_size,
     },
     "zero_optimization": {
-        "stage": 0  # Disable ZeRO for pipeline
+        "stage": 0  # Disable ZeRO for pipeline parallelism
     },
     "wall_clock_breakdown": False,
     "memory_breakdown": False
