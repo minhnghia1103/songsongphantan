@@ -272,16 +272,24 @@ class PipelineLMHead(nn.Module):
         logits = self.lm_head(hidden_states)
         return logits
 
-# Loss function với cải thiện
+# FIXED: Loss function để phù hợp với Pipeline Parallelism
 class PipelineLoss(nn.Module):
     def __init__(self, vocab_size, pad_token_id):
         super().__init__()
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id, reduction='mean')
         self.vocab_size = vocab_size
         
-    def forward(self, logits, labels):
-        if isinstance(logits, tuple):
-            logits = logits[0]
+    def forward(self, outputs, labels):
+        """
+        DeepSpeed Pipeline expects loss_fn(outputs, labels)
+        outputs: model outputs (logits)
+        labels: target labels
+        """
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+        else:
+            logits = outputs
+            
         if isinstance(labels, tuple):
             labels = labels[0]
             
@@ -384,10 +392,14 @@ ds_config = {
     "memory_breakdown": False
 }
 
-# Collate function
+# FIXED: Collate function để trả về đúng format cho Pipeline
 def collate_fn(batch):
+    """
+    Pipeline Parallelism expects input format: (input_data, labels)
+    """
     input_ids = torch.stack([item['input_ids'] for item in batch])
     labels = torch.stack([item['labels'] for item in batch])
+    # DeepSpeed Pipeline expects tuple format
     return (input_ids, labels)
 
 # DataLoaders
@@ -420,52 +432,18 @@ model_engine, optimizer, _, scheduler = deepspeed.initialize(
     config=ds_config
 )
 
-# FIXED: Training functions với manual forward/backward thay vì train_batch
+# FIXED: Training functions sử dụng train_batch() đúng cách
 def train_pipeline_step(model_engine, batch_data):
     """
-    Sử dụng manual forward/backward để tránh lỗi timer
+    Sử dụng train_batch() - đây là cách duy nhất để train với Pipeline Parallelism
     """
     try:
         model_engine.train()
         
-        # Reset gradients
-        model_engine.zero_grad()
+        # train_batch() expects the data in the format that collate_fn returns
+        loss = model_engine.train_batch(data_iter=[batch_data])
         
-        # Manual forward pass
-        input_ids, labels = batch_data
-        
-        # Ensure data is on correct device
-        if hasattr(model_engine, 'device'):
-            input_ids = input_ids.to(model_engine.device)
-            labels = labels.to(model_engine.device)
-        
-        # Forward pass through pipeline
-        outputs = model_engine(input_ids)
-        
-        # Calculate loss manually
-        if isinstance(outputs, tuple):
-            logits = outputs[0]
-        else:
-            logits = outputs
-            
-        # Shift for causal LM
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        
-        # Flatten and compute loss
-        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        shift_labels = shift_labels.view(-1)
-        
-        loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-        loss = loss_fn(shift_logits, shift_labels)
-        
-        # Backward pass
-        model_engine.backward(loss)
-        
-        # Optimizer step
-        model_engine.step()
-        
-        return loss.item() if loss is not None else None
+        return loss
         
     except Exception as e:
         if rank == 0:
@@ -473,61 +451,62 @@ def train_pipeline_step(model_engine, batch_data):
         return None
 
 def validate_pipeline_model(model_engine, dataloader, max_steps=20):
+    """
+    Validation cho Pipeline Parallelism
+    """
     model_engine.eval()
     total_loss = 0
     num_batches = 0
     
-    with torch.no_grad():
-        for batch_idx, batch_data in enumerate(dataloader):
-            if batch_idx >= max_steps:
-                break
-                
-            try:
-                input_ids, labels = batch_data
-                
-                # Ensure data is on correct device
-                if hasattr(model_engine, 'device'):
-                    input_ids = input_ids.to(model_engine.device)
-                    labels = labels.to(model_engine.device)
-                
-                # Forward pass
-                outputs = model_engine(input_ids)
-                
-                # Calculate loss
-                if isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    logits = outputs
-                    
-                # Shift for causal LM
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                
-                # Flatten and compute loss
-                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-                shift_labels = shift_labels.view(-1)
-                
-                loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-                loss = loss_fn(shift_logits, shift_labels)
-                
-                if not torch.isnan(loss):
-                    total_loss += loss.item()
-                    num_batches += 1
-                    
-            except Exception as e:
-                if rank == 0:
-                    print(f"Validation step {batch_idx} error: {e}")
-                continue
+    # Pipeline model không hỗ trợ eval mode trực tiếp như thông thường
+    # Chúng ta sẽ sử dụng train_batch() nhưng không update parameters
+    original_training_mode = model_engine.training
     
-    model_engine.train()
-    
-    if num_batches > 0:
-        avg_loss = total_loss / num_batches
-        perplexity = math.exp(min(avg_loss, 20))
-        return avg_loss, perplexity
-    return float('inf'), float('inf')
+    try:
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(dataloader):
+                if batch_idx >= max_steps:
+                    break
+                    
+                try:
+                    # Tạm thời disable gradient updates
+                    for param in model_engine.parameters():
+                        param.requires_grad = False
+                    
+                    # Use train_batch for forward pass only
+                    loss = model_engine.train_batch(data_iter=[batch_data])
+                    
+                    if loss is not None and not math.isnan(loss):
+                        total_loss += loss
+                        num_batches += 1
+                    
+                    # Re-enable gradients
+                    for param in model_engine.parameters():
+                        param.requires_grad = True
+                        
+                except Exception as e:
+                    if rank == 0:
+                        print(f"Validation step {batch_idx} error: {e}")
+                    # Re-enable gradients in case of error
+                    for param in model_engine.parameters():
+                        param.requires_grad = True
+                    continue
+        
+        model_engine.train(original_training_mode)
+        
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            perplexity = math.exp(min(avg_loss, 20))
+            return avg_loss, perplexity
+        return float('inf'), float('inf')
+        
+    except Exception as e:
+        if rank == 0:
+            print(f"Validation error: {e}")
+        model_engine.train(original_training_mode)
+        return float('inf'), float('inf')
 
-# FIXED: Training loop với manual forward/backward
+# FIXED: Training loop sử dụng train_batch()
 if rank == 0:
     print("Starting training...")
     
@@ -546,7 +525,7 @@ for epoch in range(config.num_train_epochs):
     progress_bar = tqdm(train_dataloader, desc=f"Training Epoch {epoch + 1}", disable=rank != 0)
     
     for step, batch_data in enumerate(progress_bar):
-        # Gọi training step với batch data trực tiếp
+        # Sử dụng train_batch() thay vì manual forward/backward
         loss = train_pipeline_step(model_engine, batch_data)
         
         if loss is not None and not math.isnan(loss):
