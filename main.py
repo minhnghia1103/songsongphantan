@@ -27,12 +27,31 @@ rank = int(os.environ.get('RANK', 0))
 
 print(f"Rank {rank}: Initializing with local_rank={local_rank}, world_size={world_size}")
 
-# Khởi tạo distributed training
-if not dist.is_initialized():
-    dist.init_process_group(backend='nccl')
-
+# Thiết lập CUDA device trước
 torch.cuda.set_device(local_rank)
 device = torch.device(f'cuda:{local_rank}')
+
+# Khởi tạo distributed training theo thứ tự đúng
+if not dist.is_initialized():
+    # Sử dụng NCCL backend cho GPU
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',  # Sử dụng environment variables
+        world_size=world_size,
+        rank=rank
+    )
+    print(f"Rank {rank}: Process group initialized")
+
+# Khởi tạo DeepSpeed distributed - QUAN TRỌNG: phải sau init_process_group
+deepspeed.init_distributed(
+    dist_backend='nccl',
+    auto_mpi_discovery=False,  # Tắt auto MPI discovery
+    distributed_port=29500,    # Explicit port
+    verbose=True
+)
+
+# Đồng bộ tất cả processes
+dist.barrier()
 
 # Hàm kiểm tra GPU
 def check_gpu_status():
@@ -40,6 +59,7 @@ def check_gpu_status():
     gpu_info += f"Rank {rank}: Device name: {torch.cuda.get_device_name(local_rank)}\n"
     gpu_info += f"Rank {rank}: Total GPUs: {torch.cuda.device_count()}\n"
     gpu_info += f"Rank {rank}: Memory allocated: {torch.cuda.memory_allocated(local_rank) / 1024**3:.2f} GB\n"
+    gpu_info += f"Rank {rank}: World size: {dist.get_world_size()}\n"
     return gpu_info
 
 if rank == 0:
