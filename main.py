@@ -432,10 +432,10 @@ model_engine, optimizer, _, scheduler = deepspeed.initialize(
     config=ds_config
 )
 
-# FIXED: Training functions - sửa timer issue
-def train_one_epoch_fixed(model_engine, dataloader, epoch, config):
+# FIXED: Training functions - đúng cách sử dụng train_batch()
+def train_one_epoch_pipeline(model_engine, dataloader, epoch, config):
     """
-    FIXED: Sử dụng cách tiếp cận khác để tránh timer conflict
+    FIXED: Đúng cách sử dụng train_batch() cho Pipeline mode
     """
     model_engine.train()
     total_loss = 0
@@ -444,85 +444,20 @@ def train_one_epoch_fixed(model_engine, dataloader, epoch, config):
     if rank == 0:
         progress_bar = tqdm(range(len(dataloader)), desc=f"Training Epoch {epoch + 1}")
     
-    # Convert dataloader thành list để tránh iterator issues
-    data_batches = list(dataloader)
-    max_steps = min(50, len(data_batches))  # Limit for testing
+    max_steps = min(50, len(dataloader))  # Limit for testing
+    
+    # FIXED: Tạo iterator từ dataloader - đây là cách đúng
+    data_iter = iter(dataloader)
     
     for step in range(max_steps):
         try:
-            batch = data_batches[step]
-            
-            # FIXED: Sử dụng manual forward/backward thay vì train_batch()
-            # để tránh timer conflicts
-            model_engine.train()
-            
-            # Forward pass
-            outputs = model_engine(batch)
-            loss = model_engine.criterion(outputs, batch[1])  # batch[1] is labels
-            
-            # Backward pass
-            model_engine.backward(loss)
-            model_engine.step()
-            
-            if loss is not None and not math.isnan(loss.item()):
-                loss_val = loss.item()
-                total_loss += loss_val
-                successful_steps += 1
-                
-                if rank == 0:
-                    progress_bar.update(1)
-                    progress_bar.set_postfix({
-                        'loss': f"{loss_val:.4f}",
-                        'avg_loss': f"{total_loss/successful_steps:.4f}" if successful_steps > 0 else "N/A"
-                    })
-                    
-                    if config.use_wandb and (step + 1) % config.logging_steps == 0:
-                        wandb.log({
-                            "train_loss": loss_val,
-                            "step": epoch * len(dataloader) + step + 1,
-                            "epoch": epoch + 1
-                        })
-            
-            # Clean up memory periodically
-            if step % 10 == 0:
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            if rank == 0:
-                print(f"Training step {step} error: {e}")
-            continue
-    
-    if rank == 0:
-        progress_bar.close()
-    
-    avg_loss = total_loss / successful_steps if successful_steps > 0 else float('inf')
-    return avg_loss
-
-# Alternative approach using DeepSpeed's training loop
-def train_one_epoch_deepspeed_native(model_engine, dataloader, epoch, config):
-    """
-    Alternative: Sử dụng DeepSpeed's native training approach
-    """
-    model_engine.train()
-    total_loss = 0
-    successful_steps = 0
-    
-    if rank == 0:
-        progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Training Epoch {epoch + 1}")
-    
-    max_steps = min(50, len(dataloader))  # Limit for testing
-    
-    for step, batch in enumerate(dataloader):
-        if step >= max_steps:
-            break
-            
-        try:
-            # Clear any existing timers
-            if hasattr(model_engine, 'timers'):
+            # FIXED: Reset timer trước mỗi call train_batch
+            if hasattr(model_engine, 'timers') and hasattr(model_engine.timers, 'reset'):
                 model_engine.timers.reset()
             
-            # Use the engine's forward method directly
-            loss = model_engine.forward_backward_func(batch)
+            # FIXED: Gọi train_batch() với data_iter
+            # Không dùng loop - để DeepSpeed tự handle
+            loss = model_engine.train_batch(data_iter)
             
             if loss is not None and not math.isnan(loss):
                 total_loss += loss
@@ -546,13 +481,74 @@ def train_one_epoch_deepspeed_native(model_engine, dataloader, epoch, config):
             if step % 10 == 0:
                 torch.cuda.empty_cache()
                 
+        except StopIteration:
+            if rank == 0:
+                print(f"Data iterator exhausted at step {step}")
+            break
         except Exception as e:
             if rank == 0:
                 print(f"Training step {step} error: {e}")
+            # Tạo iterator mới nếu cần
+            try:
+                data_iter = iter(dataloader)
+            except:
+                break
             continue
     
     if rank == 0:
         progress_bar.close()
+    
+    avg_loss = total_loss / successful_steps if successful_steps > 0 else float('inf')
+    return avg_loss
+
+# Alternative: Sử dụng DeepSpeed's built-in training loop
+def train_one_epoch_builtin(model_engine, dataloader, epoch, config):
+    """
+    Alternative: Sử dụng DeepSpeed's built-in training mechanisms
+    """
+    model_engine.train()
+    total_loss = 0
+    successful_steps = 0
+    
+    if rank == 0:
+        print(f"Training epoch {epoch + 1} with {len(dataloader)} batches")
+    
+    max_steps = min(50, len(dataloader))
+    
+    # Tạo một iterator mới cho mỗi epoch
+    data_iter = iter(dataloader)
+    
+    try:
+        for step in range(max_steps):
+            # Reset internal state periodically
+            if step > 0 and step % 10 == 0:
+                # Force garbage collection
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            # Train one batch
+            loss = model_engine.train_batch(data_iter)
+            
+            if loss is not None and not math.isnan(loss):
+                total_loss += loss
+                successful_steps += 1
+                
+                if rank == 0 and step % config.logging_steps == 0:
+                    print(f"Step {step}: loss = {loss:.4f}, avg_loss = {total_loss/successful_steps:.4f}")
+                    
+                    if config.use_wandb:
+                        wandb.log({
+                            "train_loss": loss,
+                            "step": epoch * len(dataloader) + step + 1,
+                            "epoch": epoch + 1
+                        })
+            
+    except StopIteration:
+        if rank == 0:
+            print(f"Completed epoch {epoch + 1} with {successful_steps} successful steps")
+    except Exception as e:
+        if rank == 0:
+            print(f"Training epoch {epoch + 1} error: {e}")
     
     avg_loss = total_loss / successful_steps if successful_steps > 0 else float('inf')
     return avg_loss
@@ -581,8 +577,8 @@ for epoch in range(config.num_train_epochs):
     if rank == 0:
         print(f"\nEpoch {epoch + 1}/{config.num_train_epochs}")
     
-    # FIXED: Sử dụng function mới để tránh timer conflicts
-    avg_train_loss = train_one_epoch_fixed(model_engine, train_dataloader, epoch, config)
+    # FIXED: Sử dụng function pipeline training mới
+    avg_train_loss = train_one_epoch_pipeline(model_engine, train_dataloader, epoch, config)
     
     if rank == 0:
         print(f"Average training loss: {avg_train_loss:.4f}")
