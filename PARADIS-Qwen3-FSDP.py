@@ -77,7 +77,7 @@ class Config:
     per_device_train_batch_size = 2
     per_device_valid_batch_size = 2
     gradient_accumulation_steps = 8
-    learning_rate = 5e-5
+    learning_rate = 2e-5
     weight_decay = 0.01
     warmup_ratio = 0.1
     max_length = MAX_LENGTH
@@ -107,9 +107,9 @@ class Config:
     # hf_repo = "h9art/PARADIS-Qwen3_1.7B-10kWikiVi-FSDP"
     
     # Dataset
-    train_size = 10000
-    valid_size = 10000
-    test_size = 5000
+    train_size = 100
+    valid_size = 100
+    test_size = 50
     min_text_length = 50
 
 # -------------------------------------------------
