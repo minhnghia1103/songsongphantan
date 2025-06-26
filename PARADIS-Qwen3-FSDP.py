@@ -78,7 +78,7 @@ class Config:
     per_device_valid_batch_size = 2
     gradient_accumulation_steps = 8
     learning_rate = 2e-5
-    weight_decay = 0.01
+    weight_decay = 0.05
     warmup_ratio = 0.1
     max_length = MAX_LENGTH
 
@@ -109,7 +109,7 @@ class Config:
     # Dataset
     train_size = 100
     valid_size = 100
-    test_size = 50
+    test_size = 500
     min_text_length = 50
 
 # -------------------------------------------------
