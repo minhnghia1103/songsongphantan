@@ -28,7 +28,7 @@ class Config:
     save_strategy = "epoch"
     evaluation_strategy = "epoch"
     wandb_project = "PARADIS-Qwen3_0.6B"
-    deepspeed_config = "./ds_config.json"
+    deepspeed_config = "./ds_config_zero3.json"
 
 # --- Step 2: Thiết lập biến môi trường và W&B ---
 def setup_environment():
