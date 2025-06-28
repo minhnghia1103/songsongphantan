@@ -1,52 +1,24 @@
-import os
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from datasets import load_dataset
 import torch
-import time
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, TrainerCallback
-from datasets import load_dataset, DatasetDict
-import wandb
-import math
+# Import thêm EarlyStoppingCallback
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, 
+    DataCollatorForLanguageModeling, EarlyStoppingCallback 
+)
 
-# --- Step 1: Cấu hình ---
-class Config:
-    """Cấu hình cho quá trình fine-tuning"""
-    model_name = "Qwen/Qwen3-0.6B"
-    dataset_name = "yahma/alpaca-cleaned"
-    output_dir = "./qwen3-0.6B-pipeline-finetuned"
-    train_size = 10000
-    valid_size = 10000
-    test_size = 5000
-    min_text_length = 50
-    max_length = 512
-    num_train_epochs = 1
-    per_device_train_batch_size = 4
-    per_device_eval_batch_size = 4
-    gradient_accumulation_steps = 16
-    learning_rate = 2e-5
-    weight_decay = 0.01
-    warmup_steps = 100
-    logging_steps = 10
-    save_strategy = "epoch"
-    evaluation_strategy = "epoch"
-    wandb_project = "PARADIS-Qwen3_0.6B"
-    deepspeed_config = "./ds_config_zero3.json"
 
-# --- Step 2: Thiết lập biến môi trường và W&B ---
-def setup_environment():
-    """Thiết lập biến môi trường và đăng nhập W&B"""
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
-    if wandb_api_key is None:
-        raise ValueError("WANDB_API_KEY không được thiết lập trong biến môi trường")
-    wandb.login(key=wandb_api_key)
-
-# --- Step 3: Load tokenizer ---
-config = Config()
-tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=True)
+# --- Step 1: Load tokenizer & EOS token ---
+model_name = "Qwen/Qwen3-0.6B"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+    
 EOS_TOKEN = tokenizer.eos_token
 
-# --- Step 4: Prompt formatting function ---
+# --- Step 2: Prompt formatting function ---
+# Prompt Alpaca phù hợp với bộ dữ liệu này.
+# Bạn có thể dịch prompt sang tiếng Việt nếu muốn, nhưng giữ nguyên cũng không sao.
 alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
@@ -64,123 +36,113 @@ def formatting_prompts_func(examples):
     outputs = examples["output"]
     texts = []
     for instruction, input_, output in zip(instructions, inputs, outputs):
-        text = alpaca_prompt.format(instruction, input_, output)
+        # Bộ dữ liệu này có thể có một số mẫu không có 'input'.
+        # Xử lý trường hợp 'input' rỗng.
+        if input_ and input_.strip():
+            text = alpaca_prompt.format(instruction, input_, output)
+        else:
+            # Dùng một biến thể prompt khác cho các tác vụ không cần input
+            prompt_no_input = """Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+                 ### Instruction:
+                {}
+
+                 ### Response:
+                {}""" + EOS_TOKEN
+            text = prompt_no_input.format(instruction, output)
         texts.append(text)
     return {"text": texts}
 
-# --- Step 5: Load và preprocess dataset ---
-def filter_function(example):
-    """Lọc các mẫu có output quá ngắn"""
-    return example['output'] is not None and len(example['output'].strip()) > config.min_text_length
+# --- Step 3: Load dataset & preprocess (ĐÃ THAY ĐỔI) ---
+# Tên bộ dữ liệu đã được cập nhật
+dataset_name = "bkai-foundation-models/vi-alpaca" 
+full_dataset = load_dataset(dataset_name, split="train")
 
-def load_and_preprocess_data():
-    """Tải và tiền xử lý dataset"""
-    dataset = load_dataset(config.dataset_name, split="train")
-    dataset = dataset.select_columns(['instruction', 'input', 'output'])
-    dataset = dataset.filter(filter_function)
-    dataset = dataset.shuffle(seed=42)
-    
-    # Tạo train, valid, test splits
-    train_split = dataset.select(range(config.train_size))
-    valid_split = dataset.select(range(config.train_size, config.train_size + config.valid_size))
-    test_split = dataset.select(range(config.train_size + config.valid_size, 
-                                    config.train_size + config.valid_size + config.test_size))
-    
-    return DatasetDict({
-        "train": train_split,
-        "valid": valid_split,
-        "test": test_split
-    })
+# Chia dataset thành tập train và validation để theo dõi overfitting
+# Chia dataset thành tập train và validation
+split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
 
-# --- Step 6: Tokenize dataset ---
+# Lấy tối đa 10.000 mẫu cho train và 10.000 cho validation
+train_dataset = split_dataset["train"].select(range(min(10000, len(split_dataset["train"]))))
+eval_dataset = split_dataset["test"].select(range(min(10000, len(split_dataset["test"]))))
+
+# Áp dụng hàm định dạng và token hóa cho cả hai tập
+train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
+eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
+
 def tokenize(example):
-    return tokenizer(example["text"], truncation=True, max_length=config.max_length, return_overflowing_tokens=False)
+    return tokenizer(example["text"], truncation=True, max_length=512)
 
-# --- Step 7: Main processing ---
-def main():
-    # Thiết lập môi trường
-    setup_environment()
-    
-    # Tải dataset và tạo splits
-    print("Đang tải và tiền xử lý dataset...")
-    dataset = load_and_preprocess_data()
-    print(f"Kích thước dataset: Train={len(dataset['train'])}, Valid={len(dataset['valid'])}, Test={len(dataset['test'])}")
-    
-    # Tokenize dataset
-    tokenized_dataset = dataset.map(formatting_prompts_func, batched=True).map(tokenize, batched=True, remove_columns=dataset["train"].column_names)
-    
-    # Load model
-    print("Đang tải model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-    )
-    
-    # Thiết lập TrainingArguments
-    training_args = TrainingArguments(
-        output_dir=config.output_dir,
-        num_train_epochs=config.num_train_epochs,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        per_device_eval_batch_size=config.per_device_eval_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        optim="adamw_torch",
-        adam_beta1=0.9,
-        adam_beta2=0.999,
-        adam_epsilon=1e-8,
-        warmup_steps=config.warmup_steps,
-        max_grad_norm=1.0,
-        logging_steps=config.logging_steps,
-        save_strategy=config.save_strategy,
-        evaluation_strategy=config.evaluation_strategy,
-        eval_steps=config.logging_steps,
-        bf16=True,
-        deepspeed=config.deepspeed_config,
-        report_to="wandb",
-        run_name=config.wandb_project,
-        gradient_checkpointing=True,
-    )
-    
-    # Khởi tạo Trainer với callback để log perplexity và thời gian
-    class CustomCallback(TrainerCallback):
-        def on_train_begin(self, args, state, control, **kwargs):
-            self.train_start_time = time.time()
+tokenized_train_dataset = train_dataset.map(tokenize, batched=True, remove_columns=train_dataset.column_names)
+tokenized_eval_dataset = eval_dataset.map(tokenize, batched=True, remove_columns=eval_dataset.column_names)
 
-        def on_train_end(self, args, state, control, **kwargs):
-            train_time = (time.time() - self.train_start_time) / 60  # Chuyển sang phút
-            wandb.log({"train_time (m)": train_time})
 
-        def on_evaluate(self, args, state, control, metrics, **kwargs):
-            if "eval_loss" in metrics:
-                perplexity = math.exp(metrics["eval_loss"])
-                valid_time = (time.time() - getattr(self, "eval_start_time", time.time())) / 60  # Chuyển sang phút
-                wandb.log({"perplexity": perplexity, "valid_time (m)": valid_time})
-            self.eval_start_time = time.time()  # Cập nhật thời gian bắt đầu đánh giá
+# --- Step 4: Load Qwen model ---
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    trust_remote_code=True,
+    torch_dtype=torch.float16,
+)
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["valid"],
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        callbacks=[CustomCallback()],  # Thêm callback tùy chỉnh
-    )
+model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+# --- Step 5: BỎ QUA PHẦN ÁP DỤNG LORA ---
+
+
+# --- Step 6: TrainingArguments (Thêm tham số cho Early Stopping) ---
+training_args = TrainingArguments(
+    output_dir="./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca",
+    num_train_epochs=5, # << Tăng số epoch lên để Early Stopping có cơ hội kích hoạt
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=16,
+    learning_rate=2e-5,
     
-    # Bắt đầu huấn luyện
-    print("Bắt đầu huấn luyện Full-Tuning với DeepSpeed Pipeline...")
-    trainer.train()
+    eval_strategy ="steps",
+    eval_steps=50,
+    save_strategy="steps",
+    save_steps=50,
     
-    # Đánh giá trên tập test
-    print("Đánh giá trên tập test...")
-    test_results = trainer.evaluate(tokenized_dataset["test"])
-    print(f"Kết quả trên tập test: {test_results}")
-    # Log test results to W&B
-    if "eval_loss" in test_results:
-        wandb.log({"test_loss": test_results["eval_loss"], "test_perplexity": math.exp(test_results["eval_loss"])})
+    # Rất quan trọng: tham số này sẽ tải lại checkpoint tốt nhất (dựa trên val_loss)
+    # khi quá trình huấn luyện kết thúc (dù là kết thúc bình thường hay do Early Stopping).
+    load_best_model_at_end=True,
+    metric_for_best_model="loss", # << Chỉ định metric để xác định "model tốt nhất" là loss
+    greater_is_better=False,     # << Vì là loss, nên giá trị nhỏ hơn là tốt hơn
+    
+    logging_steps=10,
+    bf16=False,
+    fp16=True,
+    deepspeed=r"./ds_config_zero3.json", 
+    report_to="wandb",
+    run_name="qwen2.5-finetune-vi-alpaca-early-stopping",
+    gradient_checkpointing=True,
+    
+    # Tham số này cũng hữu ích: nó sẽ giới hạn tổng số checkpoint được lưu
+    # để tránh làm đầy ổ cứng. Ví dụ, chỉ lưu 3 checkpoint gần nhất.
+    save_total_limit=2,
+)
 
-if __name__ == "__main__":
-    main()
+# --- Step 7: Trainer (Thêm callback) ---
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# Tạo callback
+# early_stopping_patience: Chờ bao nhiêu lần đánh giá trước khi dừng
+# nếu metric không cải thiện. Ví dụ, nếu loss không giảm trong 3 lần
+# đánh giá liên tiếp (3 * 50 = 150 bước), quá trình huấn luyện sẽ dừng.
+early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=3)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train_dataset,
+    eval_dataset=tokenized_eval_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    # Thêm callback vào đây
+    callbacks=[early_stopping_callback],
+)
+
+# Bắt đầu quá trình full fine-tuning
+trainer.train()
+
+# Lưu model cuối cùng (sẽ là model tốt nhất đã được tự động tải lại)
+trainer.save_model("./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca-best")
