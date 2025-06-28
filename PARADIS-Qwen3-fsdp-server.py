@@ -67,18 +67,18 @@ class Config:
     """All config for this finetune"""
 
     # Model configuration
-    model_name = "Qwen/Qwen3-0.6B"
-    # model_name = "Qwen/Qwen3-1.7B"
+    # model_name = "Qwen/Qwen3-0.6B"
+    model_name = "Qwen/Qwen3-1.7B"
     dataset_name = "yahma/alpaca-cleaned"
     
     # Training configuration
     output_dir = "./qwen-alpaca-cleaned-finetuned"
-    num_train_epochs = 5
+    num_train_epochs = 1
     per_device_train_batch_size = 2
     per_device_valid_batch_size = 2
     gradient_accumulation_steps = 8
-    learning_rate = 2e-5
-    weight_decay = 0.05
+    learning_rate = 5e-5
+    weight_decay = 0.01
     warmup_ratio = 0.1
     max_length = MAX_LENGTH
 
@@ -99,17 +99,18 @@ class Config:
     use_wandb = True
     wandb_project = "PARADIS-Qwen3_0.6B"
     # wandb_project = "PARADIS-Qwen3_1.7B"
-    wandb_run_name = "FSDP_0.6B"
+    # wandb_run_name = "FSDP_0.6B"
+    wandb_run_name = "FSDP_1.7B"
 
     # HuggingFace configuration
     use_hf = True
-    hf_repo = "MinhNghia/PARADIS-Qwen3_0.6B-alpaca-FSDP"
-    # hf_repo = "h9art/PARADIS-Qwen3_1.7B-10kWikiVi-FSDP"
+    # hf_repo = "MinhNghia/PARADIS-Qwen3_0.6B-alpaca-FSDP"
+    hf_repo = "MinhNghia/PARADIS-Qwen3_1.7B-alpaca-FSDP"
     
     # Dataset
-    train_size = 100
-    valid_size = 100
-    test_size = 500
+    train_size = 10000
+    valid_size = 10000
+    test_size = 5000
     min_text_length = 50
 
 # -------------------------------------------------
@@ -173,11 +174,17 @@ def set_env_var():
 # Get Kaggle secrets
 # -------------------------------------------------
 def get_secrets():
-    """Get Kaggle secrets"""
-    from kaggle_secrets import UserSecretsClient
-    user_secrets = UserSecretsClient()
-    HF_TOKEN = user_secrets.get_secret("HF_TOKEN")
-    WANDB_API_KEY = user_secrets.get_secret("WANDB_API_KEY")
+    """Lấy token Hugging Face và W&B từ biến môi trường hoặc tệp cấu hình"""
+    # Lấy token từ biến môi trường
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+    WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
+    
+    # Kiểm tra xem token có tồn tại không
+    if HF_TOKEN is None:
+        raise ValueError("HF_TOKEN không được thiết lập trong biến môi trường")
+    if WANDB_API_KEY is None:
+        raise ValueError("WANDB_API_KEY không được thiết lập trong biến môi trường")
+    
     return HF_TOKEN, WANDB_API_KEY
 
 # -------------------------------------------------
