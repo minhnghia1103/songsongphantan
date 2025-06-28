@@ -77,34 +77,29 @@ model = AutoModelForCausalLM.from_pretrained(
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 # --- Step 6: Sửa lại TrainingArguments cho Full Fine-Tuning ---
 training_args = TrainingArguments(
-    output_dir="./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca",
-    num_train_epochs=5, # << Tăng số epoch lên để Early Stopping có cơ hội kích hoạt
+    output_dir="./Fine-Tuning Qwen 2.5 with DeepSpeed Pipeline/qwen2-7b-pipeline-finetuned",
+    num_train_epochs=1,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=16,
     learning_rate=2e-5,
-    
+    weight_decay=0.01,
+    optim="paged_adamw_8bit",
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    adam_epsilon=1e-8,
     eval_strategy ="steps",
     eval_steps=50,
     save_strategy="steps",
     save_steps=50,
-    
-    # Rất quan trọng: tham số này sẽ tải lại checkpoint tốt nhất (dựa trên val_loss)
-    # khi quá trình huấn luyện kết thúc (dù là kết thúc bình thường hay do Early Stopping).
-    load_best_model_at_end=True,
-    metric_for_best_model="loss", # << Chỉ định metric để xác định "model tốt nhất" là loss
-    greater_is_better=False,     # << Vì là loss, nên giá trị nhỏ hơn là tốt hơn
-    
+    warmup_steps=100,
+    max_grad_norm=1.0,
     logging_steps=10,
-    bf16=False,
-    fp16=True,
-    deepspeed=r"./ds_config.json", 
-    report_to="wandb",
-    run_name="qwen2.5-finetune-vi-alpaca-early-stopping",
+    save_strategy="epoch",
+    bf16=True,
+    deepspeed="./ds_config.json",
+    report_to="wandb",                         # << Bật wandb
+    run_name="qwen2.5-finetune-pipeline",      # << Tên run
     gradient_checkpointing=True,
-    
-    # Tham số này cũng hữu ích: nó sẽ giới hạn tổng số checkpoint được lưu
-    # để tránh làm đầy ổ cứng. Ví dụ, chỉ lưu 3 checkpoint gần nhất.
-    save_total_limit=2,
 )
 
 # --- Step 7: Trainer (Giữ nguyên) ---
@@ -124,5 +119,6 @@ trainer = Trainer(
 
 print("Bắt đầu huấn luyện Full-Tuning với DeepSpeed Pipeline...")
 trainer.train()
+
 
 trainer.save_model("./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca-best")
