@@ -94,7 +94,7 @@ def load_and_preprocess_data():
 
 # --- Step 6: Tokenize dataset ---
 def tokenize(example):
-    return tokenizer(example["text"], truncation=True, max_length=config.max_length, return_overflowing_tokens=True)
+    return tokenizer(example["text"], truncation=True, max_length=config.max_length, return_overflowing_tokens=False)
 
 # --- Step 7: Main processing ---
 def main():
