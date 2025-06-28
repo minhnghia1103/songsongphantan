@@ -1,18 +1,24 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, EarlyStoppingCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
 from datasets import load_dataset
 import torch
-import os
+# Import thêm EarlyStoppingCallback
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, 
+    DataCollatorForLanguageModeling, EarlyStoppingCallback 
+)
+
 
 # --- Step 1: Load tokenizer & EOS token ---
-# Sửa nhỏ: Tên model chính thức là Qwen2
-model_name = "Qwen/Qwen3-0.6B" 
+model_name = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
     
 EOS_TOKEN = tokenizer.eos_token
 
-# --- Step 2: Prompt formatting function (Giữ nguyên) ---
+# --- Step 2: Prompt formatting function ---
+# Prompt Alpaca phù hợp với bộ dữ liệu này.
+# Bạn có thể dịch prompt sang tiếng Việt nếu muốn, nhưng giữ nguyên cũng không sao.
 alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
@@ -47,10 +53,13 @@ def formatting_prompts_func(examples):
         texts.append(text)
     return {"text": texts}
 
-# --- Step 3: Load dataset & preprocess (Giữ nguyên) ---
+# --- Step 3: Load dataset & preprocess (ĐÃ THAY ĐỔI) ---
+# Tên bộ dữ liệu đã được cập nhật
 dataset_name = "bkai-foundation-models/vi-alpaca" 
 full_dataset = load_dataset(dataset_name, split="train")
 
+# Chia dataset thành tập train và validation để theo dõi overfitting
+# Chia dataset thành tập train và validation
 split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
 
 # Lấy tối đa 10.000 mẫu cho train và 10.000 cho validation
@@ -61,13 +70,14 @@ eval_dataset = split_dataset["test"].select(range(min(10000, len(split_dataset["
 train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
 eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
 
-
 def tokenize(example):
     return tokenizer(example["text"], truncation=True, max_length=512)
 
 tokenized_train_dataset = train_dataset.map(tokenize, batched=True, remove_columns=train_dataset.column_names)
 tokenized_eval_dataset = eval_dataset.map(tokenize, batched=True, remove_columns=eval_dataset.column_names)
 
+
+# --- Step 4: Load Qwen model ---
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     trust_remote_code=True,
@@ -75,7 +85,11 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-# --- Step 6: Sửa lại TrainingArguments cho Full Fine-Tuning ---
+
+# --- Step 5: BỎ QUA PHẦN ÁP DỤNG LORA ---
+
+
+# --- Step 6: TrainingArguments (Thêm tham số cho Early Stopping) ---
 training_args = TrainingArguments(
     output_dir="./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca",
     num_train_epochs=5, # << Tăng số epoch lên để Early Stopping có cơ hội kích hoạt
@@ -97,7 +111,7 @@ training_args = TrainingArguments(
     logging_steps=10,
     bf16=False,
     fp16=True,
-    deepspeed=r"./ds_config.json", 
+    deepspeed=r"./ds_config_zero3.json", 
     report_to="wandb",
     run_name="qwen2.5-finetune-vi-alpaca-early-stopping",
     gradient_checkpointing=True,
@@ -107,8 +121,13 @@ training_args = TrainingArguments(
     save_total_limit=2,
 )
 
-# --- Step 7: Trainer (Giữ nguyên) ---
+# --- Step 7: Trainer (Thêm callback) ---
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# Tạo callback
+# early_stopping_patience: Chờ bao nhiêu lần đánh giá trước khi dừng
+# nếu metric không cải thiện. Ví dụ, nếu loss không giảm trong 3 lần
+# đánh giá liên tiếp (3 * 50 = 150 bước), quá trình huấn luyện sẽ dừng.
 early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=3)
 
 trainer = Trainer(
@@ -122,7 +141,8 @@ trainer = Trainer(
     callbacks=[early_stopping_callback],
 )
 
-print("Bắt đầu huấn luyện Full-Tuning với DeepSpeed Pipeline...")
+# Bắt đầu quá trình full fine-tuning
 trainer.train()
 
+# Lưu model cuối cùng (sẽ là model tốt nhất đã được tự động tải lại)
 trainer.save_model("./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca-best")
