@@ -69,7 +69,7 @@ class Config:
     # Model configuration
     # model_name = "Qwen/Qwen3-0.6B"
     model_name = "Qwen/Qwen3-1.7B"
-    dataset_name = "yahma/alpaca-cleaned"
+    dataset_name = "bkai-foundation-models/vi-alpaca"
     
     # Training configuration
     output_dir = "./qwen-alpaca-cleaned-finetuned"
