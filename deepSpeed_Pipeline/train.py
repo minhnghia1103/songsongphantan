@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, EarlyStoppingCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
 from datasets import load_dataset
 import torch
 import os
@@ -48,9 +48,12 @@ def formatting_prompts_func(examples):
     return {"text": texts}
 
 # --- Step 3: Load dataset & preprocess (Giữ nguyên) ---
+# Tên bộ dữ liệu đã được cập nhật
 dataset_name = "bkai-foundation-models/vi-alpaca" 
 full_dataset = load_dataset(dataset_name, split="train")
 
+# Chia dataset thành tập train và validation để theo dõi overfitting
+# Chia dataset thành tập train và validation
 split_dataset = full_dataset.train_test_split(test_size=0.05, seed=42)
 
 # Lấy tối đa 10.000 mẫu cho train và 10.000 cho validation
@@ -60,7 +63,6 @@ eval_dataset = split_dataset["test"].select(range(min(10000, len(split_dataset["
 # Áp dụng hàm định dạng và token hóa cho cả hai tập
 train_dataset = train_dataset.map(formatting_prompts_func, batched=True)
 eval_dataset = eval_dataset.map(formatting_prompts_func, batched=True)
-
 
 def tokenize(example):
     return tokenizer(example["text"], truncation=True, max_length=512)
@@ -77,20 +79,21 @@ model = AutoModelForCausalLM.from_pretrained(
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 # --- Step 6: Sửa lại TrainingArguments cho Full Fine-Tuning ---
 training_args = TrainingArguments(
-    output_dir="./Fine-Tuning Qwen 2.5 with DeepSpeed Pipeline/qwen2-7b-pipeline-finetuned",
+    output_dir="./qwen2-7b-pipeline-finetuned",
     num_train_epochs=1,
     per_device_train_batch_size=4,
     gradient_accumulation_steps=16,
     learning_rate=2e-5,
-    weight_decay=0.01,
-    optim="paged_adamw_8bit",
-    adam_beta1=0.9,
-    adam_beta2=0.999,
-    adam_epsilon=1e-8,
+
     eval_strategy ="steps",
     eval_steps=50,
     save_strategy="steps",
     save_steps=50,
+
+    weight_decay=0.01,
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    adam_epsilon=1e-8,
     warmup_steps=100,
     max_grad_norm=1.0,
     logging_steps=10,
@@ -104,7 +107,6 @@ training_args = TrainingArguments(
 
 # --- Step 7: Trainer (Giữ nguyên) ---
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=3)
 
 trainer = Trainer(
     model=model,
@@ -113,12 +115,7 @@ trainer = Trainer(
     eval_dataset=tokenized_eval_dataset,
     tokenizer=tokenizer,
     data_collator=data_collator,
-    # Thêm callback vào đây
-    callbacks=[early_stopping_callback],
 )
 
 print("Bắt đầu huấn luyện Full-Tuning với DeepSpeed Pipeline...")
 trainer.train()
-
-
-trainer.save_model("./Fine-Tuning Qwen 2.5 with DeepSpeed_Zero3/qwen2.5b-full-finetune-vi-alpaca-best")
